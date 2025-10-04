@@ -1,0 +1,310 @@
+name: Build Android APK (Full)
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: kivy/buildozer:latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate full project inline (with OpenCV/pytesseract hooks)
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          def w(p, s):
+              p = Path(p); p.parent.mkdir(parents=True, exist_ok=True); p.write_text(s, encoding="utf-8")
+
+          # ---- core ----
+          w("core/__init__.py","")
+          w("core/ports.py","""from typing import List, Tuple, Protocol, Optional
+class IOCR(Protocol):
+    def parse_entries(self, image_path: str) -> List[Tuple[str,int]]: ...
+class IRepository(Protocol):
+    def init(self) -> None: ...
+    def add_page(self, path: str, ts: str) -> int: ...
+    def add_entry(self, name: str, amount_st: int, ts: str, page_id: int | None) -> None: ...
+    def search_by_name(self, q: str) -> List[Tuple[str,int]]: ...
+""")
+          w("core/services.py","""from __future__ import annotations
+from dataclasses import dataclass
+from typing import List
+from core.ports import IOCR, IRepository
+
+@dataclass
+class SavePageService:
+    repo: IRepository
+    ocr: IOCR
+
+    def save_drawn_page(self, image_path: str, ts_iso: str) -> tuple[int, int]:
+        # опит за маска на задраскано (ако има OpenCV)
+        masked_path = image_path
+        try:
+            import cv2, numpy as np
+            from infra.ai_full import mask_crossed_out_names
+            page_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+            if page_bgr is not None:
+                masked, removed = mask_crossed_out_names(page_bgr, left_ratio=0.6)
+                import os; base, ext = os.path.splitext(image_path)
+                masked_path = base + "_masked" + (ext if ext else ".png")
+                cv2.imwrite(masked_path, masked)
+                self.last_removed_count = len(removed)
+        except Exception:
+            self.last_removed_count = 0
+
+        page_id = self.repo.add_page(image_path, ts_iso)
+        # OCR (ако липсва tesseract на Android, може да върне 0 реда — пак няма да крашне)
+        try:
+            entries = self.ocr.parse_entries(masked_path)
+        except Exception:
+            entries = []
+        n = 0
+        for name, amount_st in entries:
+            if not name or amount_st is None: continue
+            self.repo.add_entry(name=name.strip(), amount_st=int(amount_st), ts=ts_iso, page_id=page_id); n += 1
+        return page_id, n
+""")
+
+          # ---- infra ----
+          w("infra/__init__.py","")
+          w("infra/database_sqlite.py","""import sqlite3
+from typing import List, Tuple
+from core.ports import IRepository
+class SQLiteRepo(IRepository):
+    def __init__(self, db_path: str = "infra/veresia.db"):
+        self.db_path = db_path
+    def _conn(self): return sqlite3.connect(self.db_path)
+    def init(self) -> None:
+        with self._conn() as con:
+            cur=con.cursor()
+            cur.execute("CREATE TABLE IF NOT EXISTS pages(id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT, ts TEXT)")
+            cur.execute("CREATE TABLE IF NOT EXISTS entries(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, amount_st INTEGER, ts TEXT, page_id INTEGER)")
+            con.commit()
+    def add_page(self, path: str, ts: str) -> int:
+        with self._conn() as con:
+            cur=con.cursor(); cur.execute("INSERT INTO pages(path,ts) VALUES(?,?)",(path,ts)); con.commit(); return cur.lastrowid
+    def add_entry(self, name: str, amount_st: int, ts: str, page_id: int | None) -> None:
+        with self._conn() as con:
+            cur=con.cursor(); cur.execute("INSERT INTO entries(name,amount_st,ts,page_id) VALUES(?,?,?,?)",(name,amount_st,ts,page_id)); con.commit()
+    def search_by_name(self, q: str) -> List[Tuple[str,int]]:
+        with self._conn() as con:
+            cur=con.cursor()
+            if q.strip():
+                cur.execute("SELECT name, SUM(amount_st) FROM entries WHERE name LIKE ? GROUP BY name ORDER BY 2 DESC",(f"%{q}%",))
+            else:
+                cur.execute("SELECT name, SUM(amount_st) FROM entries GROUP BY name ORDER BY 2 DESC")
+            return [(r[0], int(r[1] or 0)) for r in cur.fetchall()]
+""")
+
+          # OCR via pytesseract (ако има tesseract, иначе връща празно)
+          w("infra/ocr_bul.py","""import re
+from typing import List, Tuple
+class TesseractOCR:
+    def parse_entries(self, image_path: str) -> List[Tuple[str,int]]:
+        try:
+            import cv2, pytesseract
+            img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+            if img is None: return []
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            txt = pytesseract.image_to_string(gray, lang='bul+eng') or ''
+        except Exception:
+            return []
+        out=[]
+        for ln in [l.strip() for l in txt.splitlines() if l.strip()]:
+            nums = re.findall(r'([0-9]+(?:[\\.,][0-9]{1,2})?)', ln.replace(' ',''))
+            if not nums: continue
+            val = nums[-1].replace(',','.')
+            try: st = int(round(float(val)*100))
+            except: continue
+            # име = всичко преди последното число
+            import re as _re
+            parts = _re.split(r'([0-9]+(?:[\\.,][0-9]{1,2})?)', ln)
+            name = (''.join(parts[:-2]).strip(' -:/\\t') if len(parts)>=3 else ln.strip())
+            if name: out.append((name, st))
+        return out
+""")
+
+          # AI/задраскване (OpenCV)
+          w("infra/ai_full.py","""import numpy as np, cv2
+def _binarize(gray):
+    g = cv2.GaussianBlur(gray,(3,3),0)
+    bw = cv2.adaptiveThreshold(g,255,cv2.ADAPTIVE_THRESH_MEAN_C,cv2.THRESH_BINARY_INV,21,10)
+    return cv2.medianBlur(bw,3)
+def _word_boxes(bgr, left_ratio=0.6):
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    bw = _binarize(gray)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(25,3))
+    merge = cv2.dilate(bw, kernel, 1)
+    cnts,_ = cv2.findContours(merge, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    H,W=bw.shape; mx=int(W*left_ratio); out=[]
+    for c in cnts:
+        x,y,w,h=cv2.boundingRect(c)
+        if x>mx or h<16 or w<20 or w*h<200 or h>H*0.35: continue
+        out.append((x,y,w,h))
+    out.sort(key=lambda b:(b[1]//40,b[0])); return out
+def _is_crossed(word):
+    g = cv2.cvtColor(word, cv2.COLOR_BGR2GRAY) if word.ndim==3 else word
+    h,w=g.shape[:2]
+    if w<30 or h<15: return False
+    edges=cv2.Canny(g,50,150)
+    min_len=max(12,int(0.65*w))
+    lines=cv2.HoughLinesP(edges,1,np.pi/180,threshold=30,minLineLength=min_len,maxLineGap=12)
+    if lines is None: return False
+    horiz=[]
+    for x1,y1,x2,y2 in lines.reshape(-1,4):
+        dx,dy=x2-x1,y2-y1
+        ang=abs(np.degrees(np.arctan2(dy,dx)))
+        L=max(1,int(np.hypot(dx,dy)))
+        if ang<=15 or abs(ang-180)<=15: horiz.append((dx,L,y1,y2))
+    if len(horiz)<3: return False
+    if not any(dx>0 for dx,_,_,_ in horiz): return False
+    if not any(dx<0 for dx,_,_,_ in horiz): return False
+    ys=[y1 for _,_,y1,_ in horiz]+[y2 for _,_,_,y2 in horiz]; band=max(ys)-min(ys) if ys else h
+    if band>0.45*h: return False
+    import numpy as np as _np
+    if float(_np.median([L for _,L,_,_ in horiz]))<0.7*w: return False
+    return True
+def mask_crossed_out_names(bgr,left_ratio=0.6):
+    boxes=_word_boxes(bgr,left_ratio)
+    out=bgr.copy(); removed=[]
+    for (x,y,w,h) in boxes:
+        crop=bgr[y:y+h,x:x+w]
+        if _is_crossed(crop):
+            pad=3
+            cv2.rectangle(out,(max(0,x-pad),max(0,y-pad)),(min(out.shape[1]-1,x+w+pad),min(out.shape[0]-1,y+h+pad)),(255,255,255),-1)
+            removed.append((x,y,w,h))
+    return out, removed
+""")
+
+          # ---- ui ----
+          w("ui_kivy/__init__.py","")
+          w("ui_kivy/app.py","""from datetime import datetime
+import os, time
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.uix.textinput import TextInput
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.screenmanager import Screen, ScreenManager, FadeTransition
+from kivy.graphics import Color, Rectangle, Line
+from kivy.metrics import dp
+from core.services import SavePageService
+
+class DrawArea(BoxLayout):
+    def __init__(self, **kw):
+        super().__init__(**kw); self.orientation='vertical'; self.padding=dp(8); self.spacing=dp(8)
+        self.canvas_box=BoxLayout(size_hint=(1,1)); self.add_widget(self.canvas_box)
+        with self.canvas_box.canvas: Color(1,1,1,1); self.bg=Rectangle(size=self.canvas_box.size,pos=self.canvas_box.pos)
+        self.canvas_box.bind(size=self._u,pos=self._u); self.lines=[]
+        self.canvas_box.bind(on_touch_down=self._d, on_touch_move=self._m)
+    def _u(self,*_): self.bg.size=self.canvas_box.size; self.bg.pos=self.canvas_box.pos
+    def _d(self,w,t):
+        if not self.canvas_box.collide_point(*t.pos): return
+        with self.canvas_box.canvas: Color(0,0,0,1); self.lines.append(Line(points=[*t.pos], width=2))
+    def _m(self,w,t):
+        if not self.canvas_box.collide_point(*t.pos): return
+        if self.lines: self.lines[-1].points += [*t.pos]
+    def export_to_png(self, path): self.canvas_box.export_as_image().save(path)
+
+class SearchView(Screen):
+    def __init__(self, repo, **kw):
+        super().__init__(**kw); self.repo=repo
+        root=BoxLayout(orientation='vertical')
+        top=GridLayout(cols=3, size_hint=(1,None), height=dp(64), padding=[dp(12),0,dp(12),0], spacing=dp(8))
+        with top.canvas.before: Color(0,0,0,1); self._r=Rectangle(size=top.size,pos=top.pos)
+        top.bind(size=lambda *_:self._u(top), pos=lambda *_:self._u(top))
+        btn_back=Button(text='← Платно', size_hint=(None,1), width=dp(140)); btn_back.bind(on_press=lambda *_: setattr(self.manager,'current','draw'))
+        top.add_widget(btn_back); top.add_widget(Label(text='Търсене', color=(1,1,1,1), font_size=dp(22))); top.add_widget(Label()); root.add_widget(top)
+        bar=BoxLayout(orientation='horizontal', size_hint=(1,None), height=dp(56), padding=[dp(12),dp(8)], spacing=dp(8))
+        self.search=TextInput(hint_text='🔍 Име…', multiline=False, font_size=dp(18))
+        btn=Button(text='Търси'); btn.bind(on_press=self.on_search)
+        bar.add_widget(self.search); bar.add_widget(btn); root.add_widget(bar)
+        self.results=Label(text='', halign='left', valign='top', markup=True); self.results.bind(size=lambda *_: setattr(self.results,'text_size', self.results.size))
+        sv=ScrollView(); sv.add_widget(self.results); root.add_widget(sv); self.add_widget(root)
+    def _u(self,w): self._r.size=w.size; self._r.pos=w.pos
+    def on_search(self,*_):
+        rows=self.repo.search_by_name(self.search.text or '')
+        self.results.text='Нищо не е намерено.' if not rows else '\\n'.join([f'• [b]{n}[/b] — {t/100:.2f} лв' for n,t in rows])
+
+class DrawView(Screen):
+    def __init__(self, service: SavePageService, **kw):
+        super().__init__(**kw); self.service=service
+        root=BoxLayout(orientation='vertical')
+        top=GridLayout(cols=3, size_hint=(1,None), height=dp(64), padding=[dp(12),0,dp(12),0], spacing=dp(8))
+        with top.canvas.before: Color(0,0,0.4,1,1); self._r=Rectangle(size=top.size,pos=top.pos)
+        top.bind(size=lambda *_:self._u(top), pos=lambda *_:self._u(top))
+        btn_save=Button(text='Запази'); btn_save.bind(on_press=self.on_save); top.add_widget(btn_save)
+        top.add_widget(Label(text='Платно', color=(1,1,1,1), font_size=dp(22)))
+        btn_search=Button(text='Търсене'); btn_search.bind(on_press=lambda *_: setattr(self.manager,'current','search')); top.add_widget(btn_search)
+        root.add_widget(top)
+        self.draw=DrawArea(); root.add_widget(self.draw)
+        self.status=Label(text='Готово', size_hint=(1,None), height=dp(28))
+        root.add_widget(self.status); self.add_widget(root)
+    def _u(self,w): self._r.size=w.size; self._r.pos=w.pos
+    def on_save(self,*_):
+        os.makedirs('pages', exist_ok=True)
+        ts=time.strftime('%Y%m%d_%H%M%S'); path=f'pages/page_{ts}.png'
+        try: self.draw.export_to_png(path)
+        except Exception as e: self.status.text=f'Грешка: {e}'; return
+        from datetime import datetime
+        pid,n=self.service.save_drawn_page(path, datetime.now().isoformat(timespec='seconds'))
+        self.draw.canvas_box.canvas.clear()
+        with self.draw.canvas_box.canvas: Color(1,1,1,1); self.draw.bg=Rectangle(size=self.draw.canvas_box.size,pos=self.draw.canvas_box.pos)
+        skipped=getattr(self.service,'last_removed_count',0)
+        self.status.text=f'Запазени {n} реда. Пропуснати (задраскани): {skipped}. PNG: {path}'
+
+class VeresiyaApp(App):
+    def __init__(self, repo, service, **kw):
+        super().__init__(**kw); self.repo=repo; self.service=service
+    def build(self):
+        from kivy.uix.screenmanager import ScreenManager, FadeTransition
+        sm=ScreenManager(transition=FadeTransition()); self.repo.init()
+        sm.add_widget(DrawView(self.service, name='draw')); sm.add_widget(SearchView(self.repo, name='search')); sm.current='draw'; return sm
+""")
+
+          # ---- entry ----
+          w("main.py","""from infra.database_sqlite import SQLiteRepo
+from infra.ocr_bul import TesseractOCR
+from core.services import SavePageService
+from ui_kivy.app import VeresiyaApp
+repo = SQLiteRepo()
+ocr = TesseractOCR()
+service = SavePageService(repo=repo, ocr=ocr)
+if __name__ == '__main__':
+    VeresiyaApp(repo=repo, service=service).run()
+""")
+
+          # ---- buildozer.spec (тежки зависимости) ----
+          w("buildozer.spec","""[app]
+title = Veresia
+package.name = veresia
+package.domain = com.yourstore
+source.dir = .
+source.include_exts = py,kv,png,jpg,ttf,zip,txt,md,npz,db
+version = 0.2
+requirements = python3,kivy,numpy,opencv,pillow,plyer,pytesseract
+orientation = sensor
+fullscreen = 0
+android.archs = arm64-v8a, armeabi-v7a
+android.api = 33
+android.minapi = 21
+p4a.branch = master
+android.permissions =
+""")
+          print("✅ Full project generated")
+          PY
+
+      - name: Build APK (debug)
+        run: |
+          buildozer android debug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: veresia-apk-full
+          path: bin/*.apk
